@@ -7,563 +7,694 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    background: radial-gradient(ellipse at top, #232336, #14141f);
+    background: radial-gradient(ellipse at top, #232336, #11111b);
     color: #fff;
     font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    min-height: 100vh;
-    gap: 12px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 100vh; gap: 12px;
   }
   h1 { font-size: 22px; letter-spacing: 2px; text-shadow: 0 2px 8px rgba(0,0,0,.5); }
-  canvas {
-    border-radius: 8px;
-    box-shadow: 0 12px 48px rgba(0,0,0,.7);
-    touch-action: none;
-  }
-  #info { font-size: 13px; color: #99a; text-align: center; line-height: 1.6; }
+  canvas { border-radius: 8px; box-shadow: 0 12px 48px rgba(0,0,0,.7); touch-action: none; background:#11111b; }
+  #info { font-size: 13px; color:#99a; text-align:center; line-height:1.6; }
 </style>
 </head>
 <body>
 <h1>🚗 カーチェイス! 🚓</h1>
-<canvas id="game" width="420" height="640"></canvas>
-<div id="info">← → / A D で移動、↑ ↓ で加速・減速(スマホはスワイプ)<br>
-一般車にぶつかるとスピードダウン → パトカーに捕まったらゲームオーバー!</div>
+<canvas id="game" width="440" height="660"></canvas>
+<div id="info">← → / A D でハンドル、↑ ↓ で加速・減速(スマホは画面の左右をタッチ)<br>
+60秒以内にゴールを目指せ! トンネル・海峡大橋を越えろ。他車やビルに激突で減速、パトカーに捕まると御用。</div>
 
 <script>
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const W = canvas.width, H = canvas.height;
 
-// 道路設定
-const ROAD_X = 64, ROAD_W = W - 128;
-const LANES = 4;
-const LANE_W = ROAD_W / LANES;
+// ===== 擬似3D パラメータ =====
+const segmentLength = 200;
+const roadWidth     = 2000;
+const rumbleSeg     = 4;
+const cameraHeight  = 1200;
+const cameraDepth   = 0.84;
+const drawDistance  = 150;
+const dt            = 1/60;
+const maxSpeed      = segmentLength / dt;
+const accel         = maxSpeed / 4.5;
+const breaking      = -maxSpeed;
+const decel         = -maxSpeed / 5;
+const offRoadDecel  = -maxSpeed / 2.3;
+const offRoadLimit  = maxSpeed / 3.2;
+const CENTRIFUGAL   = 0.20;
+const TIME_LIMIT    = 60;        // 秒
+const TUN_H         = 2600;      // トンネル内空の高さ(ワールド)
 
-// ゲーム状態
-let state = 'title'; // title | play | over
+// テーマ別の色
+const THEME = {
+  country:{ road:['#3b3b40','#343439'], verge:['#3f7a37','#3a7233'], rumble:['#e8e8e8','#c23b3b'] },
+  city:   { road:['#36363d','#303037'], verge:['#5a5a62','#54545c'], rumble:['#e8e8e8','#c23b3b'] },
+  tunnel: { road:['#2e2e34','#282830'], verge:['#26262c','#202024'], rumble:['#c9a24a','#7a6020'] },
+  bridge: { road:['#4a4a54','#44444d'], verge:['#1f5f86','#1b5880'], rumble:['#edeef0','#9aa6b2'] },
+  finish: { road:['#3a3a42','#333339'], verge:['#5a5a62','#54545c'], rumble:['#222','#eee'] },
+};
+
+// 時間変化のキーフレーム(朝→昼→夕→夜)
+const SKY = [
+  { t:0,  top:'#2a4a7a', mid:'#e6a070', bot:'#f7dcb4', dark:0.00 },
+  { t:18, top:'#3f82c8', mid:'#9cc4e8', bot:'#e4f0fb', dark:0.00 },
+  { t:38, top:'#2a2f5a', mid:'#8a5570', bot:'#e08a56', dark:0.14 },
+  { t:60, top:'#0a0e2a', mid:'#182042', bot:'#2a2a48', dark:0.46 },
+];
+
+// ===== 状態 =====
+let state = 'title';     // title | count | play | win | lose
+let loseReason = '';     // caught | timeup
 let keys = {};
-let score = 0;
-let best = +(localStorage.getItem('carChaseBest') || 0);
-let frame = 0;
+let elapsed = 0;         // プレイ経過秒(0..60)
+let timeLeft = TIME_LIMIT;
+let countT = 0;          // カウントダウン残り
+let bestTime = +(localStorage.getItem('carChaseBestTime') || 0); // 残り秒(大きいほど良い)
 
-const player = { x: W/2, y: H - 170, w: 36, h: 64, speed: 0, vx: 0, tilt: 0 };
-const police = { x: W/2, y: H + 80, w: 38, h: 66, tilt: 0 };
-let traffic = [];
+let position = 0, speed = 0, playerX = 0, steerTouch = 0;
+let distance = 0, score = 0;
+let shake = 0, flashRed = 0, policeGap = 260;
 let particles = [];
-let roadside = [];   // 街路樹・標識
-let dashOffset = 0;
-let texOffset = 0;
-let shake = 0;
-let policeGap = 260;
 
-// ===== アスファルトのテクスチャを事前生成 =====
-const TEX_H = 512;
-const asphalt = document.createElement('canvas');
-asphalt.width = ROAD_W; asphalt.height = TEX_H;
-(function makeAsphalt() {
-  const c = asphalt.getContext('2d');
-  c.fillStyle = '#36363e';
-  c.fillRect(0, 0, ROAD_W, TEX_H);
-  // 粒状のざらつき
-  for (let i = 0; i < 2600; i++) {
-    const v = 40 + Math.random() * 40;
-    c.fillStyle = `rgba(${v},${v},${v+6},${0.25 + Math.random()*0.3})`;
-    c.fillRect(Math.random() * ROAD_W, Math.random() * TEX_H, 1.5, 1.5);
-  }
-  // ひび割れ
-  for (let i = 0; i < 7; i++) {
-    c.strokeStyle = 'rgba(20,20,24,.45)';
-    c.lineWidth = 1;
-    let x = Math.random() * ROAD_W, y = Math.random() * TEX_H;
-    c.beginPath(); c.moveTo(x, y);
-    for (let j = 0; j < 6; j++) {
-      x += (Math.random() - 0.5) * 30; y += Math.random() * 24;
-      c.lineTo(x, y);
-    }
-    c.stroke();
-  }
-  // 各車線のタイヤ痕(うっすら黒い2本筋)
-  for (let l = 0; l < LANES; l++) {
-    const cx = LANE_W * (l + 0.5);
-    for (const off of [-11, 11]) {
-      const g = c.createLinearGradient(cx + off - 5, 0, cx + off + 5, 0);
-      g.addColorStop(0, 'rgba(0,0,0,0)');
-      g.addColorStop(0.5, 'rgba(0,0,0,.22)');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      c.fillStyle = g;
-      c.fillRect(cx + off - 5, 0, 10, TEX_H);
-    }
-  }
-})();
+let segments = [], trackLength = 0, goalZ = 0, zones = [];
+let cars = [];
 
-function reset() {
-  score = 0; frame = 0;
-  player.x = W/2; player.vx = 0; player.speed = 5;
-  policeGap = 260;
-  traffic = []; particles = [];
-  shake = 0;
-  roadside = [];
-  for (let y = -40; y < H + 40; y += 90) spawnRoadside(y);
+// ===== 補助 =====
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,p)=>a+(b-a)*p;
+function hex2rgb(h){const n=parseInt(h.slice(1),16);return[n>>16,(n>>8)&255,n&255];}
+function lerpHex(h1,h2,p){const a=hex2rgb(h1),b=hex2rgb(h2);
+  return `rgb(${Math.round(lerp(a[0],b[0],p))},${Math.round(lerp(a[1],b[1],p))},${Math.round(lerp(a[2],b[2],p))})`;}
+function shade(hex, amt){const n=parseInt(hex.slice(1),16);
+  const r=clamp((n>>16)+amt,0,255),g=clamp(((n>>8)&255)+amt,0,255),b=clamp((n&255)+amt,0,255);
+  return `rgb(${r},${g},${b})`;}
+function rr(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function poly(x1,y1,x2,y2,x3,y3,x4,y4,color){ctx.fillStyle=color;ctx.beginPath();
+  ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.lineTo(x3,y3);ctx.lineTo(x4,y4);ctx.closePath();ctx.fill();}
+
+function skyAt(t){
+  let a=SKY[0], b=SKY[SKY.length-1];
+  for(let i=0;i<SKY.length-1;i++){ if(t>=SKY[i].t && t<=SKY[i+1].t){a=SKY[i];b=SKY[i+1];break;} }
+  const p = b.t===a.t?0:clamp((t-a.t)/(b.t-a.t),0,1);
+  return { top:lerpHex(a.top,b.top,p), mid:lerpHex(a.mid,b.mid,p), bot:lerpHex(a.bot,b.bot,p), dark:lerp(a.dark,b.dark,p) };
 }
 
-function spawnRoadside(y) {
-  for (const side of [0, 1]) {
-    if (Math.random() < 0.75) {
-      roadside.push({
-        side, y: y + (Math.random() - 0.5) * 30,
-        type: Math.random() < 0.8 ? 'tree' : 'bush',
-        size: 14 + Math.random() * 9,
-        tone: Math.random(),
-      });
+// ===== トラック生成 =====
+const L = { SHORT:15, MEDIUM:30, LONG:55 };
+const Curve = { EASY:2, MEDIUM:4, HARD:6 };
+let buildTheme = 'country';
+
+function addSegment(curve){
+  const n = segments.length;
+  const th = buildTheme;
+  segments.push({
+    index:n, curve, theme:th,
+    p1:{world:{z:n*segmentLength},camera:{},screen:{}},
+    p2:{world:{z:(n+1)*segmentLength},camera:{},screen:{}},
+    color: Math.floor(n/rumbleSeg)%2 ? 1 : 0,
+    sprites: [],
+  });
+}
+function addRoad(enter,hold,leave,curve){
+  for(let i=0;i<enter;i++) addSegment(lerp(0,curve,Math.pow(i/enter,2)));
+  for(let i=0;i<hold;i++)  addSegment(curve);
+  for(let i=0;i<leave;i++) addSegment(lerp(curve,0,(-Math.cos(i/leave*Math.PI)/2)+0.5));
+}
+function addStraight(n){ addRoad(n,n,n,0); }
+function addCurve(n,c){ addRoad(n,n,n,c); }
+function addS(n,c){ addRoad(n,n,n,c); addRoad(n,n,n,-c); }   // S字(シケイン)
+function zone(theme, fn){ buildTheme=theme; const start=segments.length; fn(); zones.push({theme,start,end:segments.length}); }
+
+function buildTrack(){
+  segments=[]; zones=[];
+  // 田舎(ウォームアップ): 緩やかな左右
+  zone('country', ()=>{ addStraight(L.SHORT); addCurve(L.MEDIUM,Curve.EASY); addStraight(L.SHORT);
+    addCurve(L.MEDIUM,-Curve.MEDIUM); addStraight(L.SHORT); });
+  // 田舎シケイン + 直線スパート
+  zone('country', ()=>{ addS(L.SHORT,Curve.MEDIUM); addStraight(L.LONG); addCurve(L.MEDIUM,Curve.EASY); });
+  // 都会: 中〜急カーブとS字
+  zone('city',    ()=>{ addCurve(L.MEDIUM,Curve.HARD); addStraight(L.SHORT); addS(L.SHORT,Curve.MEDIUM);
+    addCurve(L.MEDIUM,-Curve.HARD); addStraight(L.SHORT); });
+  // トンネル: 中にカーブ
+  zone('tunnel',  ()=>{ addStraight(L.MEDIUM); addCurve(L.MEDIUM,Curve.MEDIUM); addStraight(L.SHORT); });
+  // 海峡大橋: ロングスイーパー
+  zone('bridge',  ()=>{ addStraight(L.MEDIUM); addCurve(L.LONG,Curve.EASY); addStraight(L.MEDIUM); addCurve(L.MEDIUM,-Curve.EASY); addStraight(L.SHORT); });
+  // 渡った先の田舎: 海沿いの大きなうねり
+  zone('country', ()=>{ addCurve(L.MEDIUM,Curve.MEDIUM); addS(L.SHORT,Curve.HARD); addStraight(L.SHORT); });
+  // 最後の都会: 連続カーブ
+  zone('city',    ()=>{ addCurve(L.MEDIUM,-Curve.HARD); addStraight(L.SHORT); addCurve(L.MEDIUM,Curve.MEDIUM); });
+  // ゴール直線
+  zone('finish',  ()=>{ addStraight(L.MEDIUM); });
+  trackLength = segments.length*segmentLength;
+  goalZ = (segments.length-6)*segmentLength;
+  decorate();
+}
+
+const BLD = ['#6d7a8c','#8a7f72','#7a6d82','#5f7384','#8c7a6d','#4f5a6b','#9a8f7f'];
+function decorate(){
+  for(const z of zones){
+    for(let n=z.start;n<z.end;n++){
+      const seg=segments[n];
+      if(z.theme==='country'){
+        for(const side of [-1,1]) if(Math.random()<0.5)
+          seg.sprites.push({kind:'tree', offset:side*(1.25+Math.random()*1.4), w:360+Math.random()*260, h:520+Math.random()*520, tone:Math.random()});
+        if(n%55===0) for(const side of [-1,1])
+          seg.sprites.push({kind:'bld', offset:side*1.4, w:620, h:560+Math.random()*300, color:'#c7b89a', windows:true, lit:Math.random()});
+      } else if(z.theme==='city'){
+        for(const side of [-1,1]) if(Math.random()<0.74)
+          seg.sprites.push({kind:'bld', offset:side*(1.3+Math.random()*1.0), w:700+Math.random()*1100, h:900+Math.random()*2800,
+            color:BLD[(Math.random()*BLD.length)|0], windows:Math.random()<0.88, lit:Math.random()});
+        if(n%9===0) for(const side of [-1,1]) seg.sprites.push({kind:'lamp', offset:side*1.12});
+      } else if(z.theme==='bridge'){
+        if(n%7===0) for(const side of [-1,1]) seg.sprites.push({kind:'lamp', offset:side*1.08});
+      }
+    }
+    // 吊り橋の主塔を2本
+    if(z.theme==='bridge'){
+      const a=z.start+Math.floor((z.end-z.start)*0.28);
+      const b=z.start+Math.floor((z.end-z.start)*0.66);
+      segments[a].sprites.push({kind:'tower'});
+      segments[b].sprites.push({kind:'tower'});
+    }
+    // ゴールゲート
+    if(z.theme==='finish'){ segments[z.start+2].sprites.push({kind:'goal'}); }
+    // ゾーン看板(入口・最初のゾーン以外)
+    if(z.start>0 && ZONE_SIGN[z.theme]) segments[z.start+3].sprites.push({kind:'zonesign', text:ZONE_SIGN[z.theme]});
+  }
+  // カーブ警告標識: 直線→顕著なカーブへの入口の手前に設置
+  for(let n=3;n<segments.length;n++){
+    const c=segments[n].curve, pc=segments[n-1].curve;
+    if(Math.abs(c)>Curve.EASY+0.6 && Math.abs(pc)<=Curve.EASY+0.6){
+      const at=Math.max(0,n-12), dir=c>0?1:-1;
+      if(!segments[at].sprites.some(s=>s.kind==='sign'))
+        segments[at].sprites.push({kind:'sign', dir, sharp:Math.abs(c)>=Curve.HARD-0.5, offset:-1.16});
     }
   }
+}
+const ZONE_SIGN = { city:'都会 CITY', tunnel:'トンネル', bridge:'海峡大橋', country:'田舎道', finish:'GOAL まもなく' };
+
+function themeAt(z){ const s=findSegment(z); return s?s.theme:'country'; }
+function findSegment(z){ return segments[clamp(Math.floor(z/segmentLength),0,segments.length-1)]; }
+
+// ===== 他車 =====
+const CARCOL=['#d9a521','#5fa83a','#7a4f9b','#d6d9dd','#1f7fa8','#aa3a30','#2b8c8c'];
+const LANES=[-0.62,0,0.62];
+function spawnCar(aheadMin,aheadMax){
+  const z = position + (aheadMin+Math.random()*(aheadMax-aheadMin))*segmentLength;
+  return { offset:LANES[(Math.random()*LANES.length)|0]+(Math.random()-0.5)*0.12,
+    z: Math.min(z, goalZ-segmentLength),
+    speed: maxSpeed*(0.34+Math.random()*0.30), color:CARCOL[(Math.random()*CARCOL.length)|0], passed:false };
+}
+function resetCars(){ cars=[]; for(let i=0;i<6;i++) cars.push(spawnCar(20,drawDistance*0.95)); }
+
+function startRun(){
+  position=0; speed=0; playerX=0; steerTouch=0; distance=0; score=0;
+  elapsed=0; timeLeft=TIME_LIMIT; policeGap=285; shake=0; flashRed=0; particles=[];
+  buildTrack(); resetCars();
 }
 
 // ===== 入力 =====
-addEventListener('keydown', e => {
-  keys[e.key.toLowerCase()] = true;
-  if (e.key.startsWith('Arrow')) e.preventDefault();
-  if (state !== 'play' && (e.key === ' ' || e.key === 'Enter')) {
-    reset(); state = 'play';
+addEventListener('keydown', e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(e.key.startsWith('Arrow')) e.preventDefault();
+  if((e.key===' '||e.key==='Enter')){
+    if(state==='title'){ beginCountdown(); }
+    else if(state==='win'||state==='lose'){ state='title'; }
   }
 });
-addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+addEventListener('keyup', e=> keys[e.key.toLowerCase()]=false);
 
-let touchX = null;
-canvas.addEventListener('touchstart', e => {
-  if (state !== 'play') { reset(); state = 'play'; }
-  touchX = e.touches[0].clientX;
-});
-canvas.addEventListener('touchmove', e => {
-  e.preventDefault();
-  const x = e.touches[0].clientX;
-  player.x += (x - touchX) * 1.2;
-  touchX = x;
-}, { passive: false });
-canvas.addEventListener('mousedown', () => {
-  if (state !== 'play') { reset(); state = 'play'; }
-});
+function touchToSteer(cx){ const r=canvas.getBoundingClientRect(); const rel=(cx-r.left)/r.width;
+  steerTouch=clamp((rel-0.5)*2.4,-1,1); }
+canvas.addEventListener('touchstart', e=>{ handleTap(); if(state==='play') touchToSteer(e.touches[0].clientX); }, {passive:true});
+canvas.addEventListener('touchmove', e=>{ e.preventDefault(); if(state==='play') touchToSteer(e.touches[0].clientX); }, {passive:false});
+canvas.addEventListener('touchend', ()=> steerTouch=0);
+canvas.addEventListener('mousedown', ()=> handleTap());
+function handleTap(){ if(state==='title') beginCountdown(); else if(state==='win'||state==='lose') state='title'; }
+function beginCountdown(){ startRun(); state='count'; countT=3.0; }
 
-// ===== ユーティリティ =====
-function roundRect(c, x, y, w, h, r) {
-  c.beginPath();
-  c.moveTo(x + r, y);
-  c.arcTo(x + w, y, x + w, y + h, r);
-  c.arcTo(x + w, y + h, x, y + h, r);
-  c.arcTo(x, y + h, x, y, r);
-  c.arcTo(x, y, x + w, y, r);
-  c.closePath();
-}
-
-function shade(hex, amt) {
-  const n = parseInt(hex.slice(1), 16);
-  const r = Math.max(0, Math.min(255, (n >> 16) + amt));
-  const g = Math.max(0, Math.min(255, ((n >> 8) & 255) + amt));
-  const b = Math.max(0, Math.min(255, (n & 255) + amt));
-  return `rgb(${r},${g},${b})`;
-}
-
-// ===== 車の描画(トップビュー・ディテール強化) =====
-// type: 'player' | 'police' | 'sedan' | 'truck'
-function drawCar(x, y, w, h, color, type, tilt = 0) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(tilt);
-
-  // 落ち影
-  ctx.fillStyle = 'rgba(0,0,0,.4)';
-  ctx.beginPath();
-  ctx.ellipse(2, 4, w * 0.62, h * 0.56, 0, 0, Math.PI * 2);
-  ctx.fill();
-
-  // タイヤ(ボディからわずかにはみ出す)
-  ctx.fillStyle = '#0c0c0e';
-  const ty = type === 'truck' ? [ -h*0.34, h*0.05, h*0.3 ] : [ -h*0.3, h*0.26 ];
-  for (const yy of ty) {
-    roundRect(ctx, -w/2 - 3, yy, 6, h*0.18, 2); ctx.fill();
-    roundRect(ctx,  w/2 - 3, yy, 6, h*0.18, 2); ctx.fill();
-  }
-
-  // ボディ(先端をすぼめたシルエット)
-  const bodyPath = () => {
-    ctx.beginPath();
-    ctx.moveTo(0, -h/2);
-    ctx.quadraticCurveTo(w*0.5, -h/2, w/2, -h/2 + h*0.2);
-    ctx.lineTo(w/2, h/2 - h*0.12);
-    ctx.quadraticCurveTo(w/2, h/2, w*0.3, h/2);
-    ctx.lineTo(-w*0.3, h/2);
-    ctx.quadraticCurveTo(-w/2, h/2, -w/2, h/2 - h*0.12);
-    ctx.lineTo(-w/2, -h/2 + h*0.2);
-    ctx.quadraticCurveTo(-w*0.5, -h/2, 0, -h/2);
-    ctx.closePath();
-  };
-  // 左右の縁を暗く、中央を明るく → 曲面の反射らしさ
-  const g = ctx.createLinearGradient(-w/2, 0, w/2, 0);
-  g.addColorStop(0, shade(color, -45));
-  g.addColorStop(0.5, shade(color, 28));
-  g.addColorStop(1, shade(color, -45));
-  ctx.fillStyle = g;
-  bodyPath(); ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,.45)';
-  ctx.lineWidth = 1.2;
-  bodyPath(); ctx.stroke();
-
-  if (type === 'truck') {
-    // 荷台(コンテナ)
-    ctx.fillStyle = shade(color, -15);
-    roundRect(ctx, -w/2 + 3, -h*0.16, w - 6, h*0.62, 3); ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,.4)';
-    roundRect(ctx, -w/2 + 3, -h*0.16, w - 6, h*0.62, 3); ctx.stroke();
-    // コンテナの縦リブ
-    ctx.strokeStyle = 'rgba(0,0,0,.22)';
-    for (let i = 1; i < 5; i++) {
-      const yy = -h*0.16 + (h*0.62) * i / 5;
-      ctx.beginPath(); ctx.moveTo(-w/2 + 4, yy); ctx.lineTo(w/2 - 4, yy); ctx.stroke();
-    }
-    // キャブの窓
-    ctx.fillStyle = '#1d2b3a';
-    roundRect(ctx, -w/2 + 5, -h/2 + h*0.16, w - 10, h*0.12, 3); ctx.fill();
-  } else {
-    // フロントガラス(台形)
-    const wsTop = -h*0.27, wsBot = -h*0.1;
-    const wg = ctx.createLinearGradient(0, wsTop, 0, wsBot);
-    wg.addColorStop(0, '#9fc4e0');
-    wg.addColorStop(1, '#27425c');
-    ctx.fillStyle = wg;
-    ctx.beginPath();
-    ctx.moveTo(-w*0.34, wsTop);
-    ctx.lineTo(w*0.34, wsTop);
-    ctx.lineTo(w*0.4, wsBot);
-    ctx.lineTo(-w*0.4, wsBot);
-    ctx.closePath(); ctx.fill();
-
-    // ルーフ
-    ctx.fillStyle = shade(color, -12);
-    roundRect(ctx, -w*0.4, -h*0.1, w*0.8, h*0.34, 4); ctx.fill();
-    // ルーフのハイライト
-    ctx.fillStyle = 'rgba(255,255,255,.10)';
-    roundRect(ctx, -w*0.18, -h*0.1, w*0.36, h*0.34, 4); ctx.fill();
-
-    // リアガラス
-    ctx.fillStyle = '#1d2b3a';
-    ctx.beginPath();
-    ctx.moveTo(-w*0.38, h*0.26);
-    ctx.lineTo(w*0.38, h*0.26);
-    ctx.lineTo(w*0.32, h*0.38);
-    ctx.lineTo(-w*0.32, h*0.38);
-    ctx.closePath(); ctx.fill();
-
-    // サイドミラー
-    ctx.fillStyle = shade(color, -30);
-    ctx.fillRect(-w/2 - 4, -h*0.2, 5, 4);
-    ctx.fillRect(w/2 - 1, -h*0.2, 5, 4);
-  }
-
-  // ヘッドライト
-  ctx.fillStyle = '#ffe9a8';
-  roundRect(ctx, -w*0.38, -h/2 + 2, w*0.2, 5, 2); ctx.fill();
-  roundRect(ctx,  w*0.18, -h/2 + 2, w*0.2, 5, 2); ctx.fill();
-  // テールランプ
-  ctx.fillStyle = '#d8202a';
-  roundRect(ctx, -w*0.42, h/2 - 6, w*0.26, 4, 2); ctx.fill();
-  roundRect(ctx,  w*0.16, h/2 - 6, w*0.26, 4, 2); ctx.fill();
-
-  if (type === 'police') {
-    // 白黒ツートン
-    ctx.fillStyle = 'rgba(255,255,255,.88)';
-    ctx.beginPath();
-    ctx.moveTo(-w/2 + 2, -h*0.07);
-    ctx.lineTo(w/2 - 2, -h*0.07);
-    ctx.lineTo(w/2 - 2, h*0.3);
-    ctx.lineTo(-w/2 + 2, h*0.3);
-    ctx.closePath(); ctx.fill();
-    // ルーフの赤色灯バー
-    const blink = Math.floor(frame / 7) % 2 === 0;
-    ctx.fillStyle = '#222';
-    roundRect(ctx, -w*0.34, -h*0.02, w*0.68, 9, 3); ctx.fill();
-    ctx.fillStyle = blink ? '#ff2233' : '#55121a';
-    roundRect(ctx, -w*0.3, 0, w*0.26, 5, 2); ctx.fill();
-    ctx.fillStyle = blink ? '#27246b' : '#2244ff';
-    roundRect(ctx, w*0.04, 0, w*0.26, 5, 2); ctx.fill();
-    // 点滅の光が路面に落ちる
-    const lg = ctx.createRadialGradient(0, 0, 5, 0, 0, 70);
-    lg.addColorStop(0, blink ? 'rgba(255,40,60,.30)' : 'rgba(50,80,255,.30)');
-    lg.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = lg;
-    ctx.beginPath(); ctx.arc(0, 0, 70, 0, Math.PI * 2); ctx.fill();
-  }
-
-  ctx.restore();
+// ===== 投影 =====
+function project(p,camX,camY,camZ){
+  p.camera.x=(p.world.x||0)-camX; p.camera.y=(p.world.y||0)-camY; p.camera.z=(p.world.z||0)-camZ;
+  p.screen.scale=cameraDepth/p.camera.z;
+  p.screen.x=Math.round(W/2 + p.screen.scale*p.camera.x*W/2);
+  p.screen.y=Math.round(H/2 - p.screen.scale*p.camera.y*H/2);
+  p.screen.w=Math.round(p.screen.scale*roadWidth*W/2);
 }
 
 // ===== 更新 =====
-function update() {
-  frame++;
-  const difficulty = 1 + frame / 3600;
+function update(){
+  if(state==='count'){ countT-=dt; if(countT<=0) state='play'; return; }
+  if(state!=='play') return;
 
-  const move = 6;
-  if (keys['arrowleft'] || keys['a']) player.vx -= 1.2;
-  if (keys['arrowright'] || keys['d']) player.vx += 1.2;
-  player.vx *= 0.85;
-  player.vx = Math.max(-move, Math.min(move, player.vx));
-  player.x += player.vx;
-  player.x = Math.max(ROAD_X + player.w/2, Math.min(ROAD_X + ROAD_W - player.w/2, player.x));
-  player.tilt = player.vx * 0.035; // ハンドルを切ると車体が傾く
+  elapsed+=dt; timeLeft=Math.max(0,TIME_LIMIT-elapsed);
+  const difficulty=1+elapsed/95;
+  const speedPercent=speed/maxSpeed;
+  const pSeg=findSegment(position+segmentLength);
 
-  const maxSpeed = 11 * difficulty;
-  if (keys['arrowup'] || keys['w']) player.speed += 0.12;
-  else if (keys['arrowdown'] || keys['s']) player.speed -= 0.25;
-  else player.speed += 0.04;
-  player.speed = Math.max(3, Math.min(maxSpeed, player.speed));
+  if(keys['arrowup']||keys['w']) speed+=accel*dt;
+  else if(keys['arrowdown']||keys['s']) speed+=breaking*dt;
+  else speed+=accel*0.35*dt;
+  const offRoad=Math.abs(playerX)>1;
+  if(offRoad){ speed+=offRoadDecel*dt; if(speed>offRoadLimit) speed=offRoadLimit+(speed-offRoadLimit)*0.9;
+    if(Math.floor(elapsed*30)%2===0) shake=Math.max(shake,3); }
+  speed=clamp(speed,0,maxSpeed);
 
-  score += player.speed / 10;
-  dashOffset = (dashOffset + player.speed) % 48;
-  texOffset = (texOffset + player.speed) % TEX_H;
+  const dx=dt*2.9*speedPercent;            // ハンドル応答(上げて曲がりやすく)
+  let steer=0;
+  if(keys['arrowleft']||keys['a']) steer=-1;
+  else if(keys['arrowright']||keys['d']) steer=1;
+  else if(steerTouch!==0) steer=steerTouch;
+  playerX+=steer*dx;
+  playerX-=dx*speedPercent*pSeg.curve*CENTRIFUGAL*Math.min(1.4,difficulty);
+  playerX=clamp(playerX,-2.2,2.2);
 
-  // 路肩オブジェクトのスクロール
-  for (const r of roadside) r.y += player.speed;
-  roadside = roadside.filter(r => r.y < H + 60);
-  if (frame % Math.max(4, Math.round(90 / player.speed)) === 0) spawnRoadside(-50);
+  position+=speed*dt; distance+=speed*dt; score=Math.floor(distance/100);
 
-  // 一般車スポーン
-  const spawnRate = Math.max(28, 70 - frame / 120);
-  if (frame % Math.floor(spawnRate) === 0) {
-    const lane = Math.floor(Math.random() * LANES);
-    const truck = Math.random() < 0.18;
-    traffic.push({
-      x: ROAD_X + LANE_W * (lane + 0.5),
-      y: truck ? -120 : -80,
-      w: truck ? 40 : 34, h: truck ? 96 : 58,
-      speed: 2 + Math.random() * 2.5,
-      color: truck
-        ? ['#c8cdd4','#5d7a99','#8a6f55'][Math.floor(Math.random()*3)]
-        : ['#d9a521','#5fa83a','#7a4f9b','#d6d9dd','#1f7fa8','#aa3a30'][Math.floor(Math.random()*6)],
-      type: truck ? 'truck' : 'sedan',
-      hit: false,
-    });
+  // ゴール判定
+  if(position>=goalZ){
+    position=goalZ; state='win';
+    const remain=Math.round(timeLeft*10)/10;
+    if(remain>bestTime){ bestTime=remain; localStorage.setItem('carChaseBestTime',bestTime); }
+    return;
   }
+  // タイムアップ
+  if(timeLeft<=0){ state='lose'; loseReason='timeup'; return; }
 
-  for (const t of traffic) {
-    t.y += player.speed - t.speed;
-    if (!t.hit &&
-        Math.abs(t.x - player.x) < (t.w + player.w)/2 - 6 &&
-        Math.abs(t.y - player.y) < (t.h + player.h)/2 - 6) {
-      t.hit = true;
-      player.speed = Math.max(3, player.speed * 0.45);
-      policeGap -= 70;
-      shake = 14;
-      // 火花と破片
-      for (let i = 0; i < 22; i++) {
-        particles.push({
-          x: (player.x + t.x)/2, y: (player.y + t.y)/2,
-          vx: (Math.random()-0.5)*7, vy: (Math.random()-0.5)*7 + 2,
-          life: 18 + Math.random()*14,
-          color: Math.random() < 0.6 ? '#ffcc55' : '#ff8833',
-        });
-      }
+  // 壁/欄干/ビルへの接触(描画位置に合わせて: トンネル・橋は路端、街はビル手前)
+  const barrier = (pSeg.theme==='tunnel'||pSeg.theme==='bridge') ? 1.12 : 1.55;
+  if(Math.abs(playerX)>barrier && speed>offRoadLimit*0.6){ crash(0.5,58,22); playerX=(playerX>0?barrier:-barrier)*0.96; }
+
+  // 他車(判定幅は描画サイズ基準: 自車+相手の半幅 ≒ 0.30)
+  for(const car of cars){
+    car.z+=car.speed*dt;
+    const fd=car.z-position;
+    if(fd<segmentLength*1.25 && fd>-segmentLength*0.6 && !car.passed){
+      if(Math.abs(playerX-car.offset)<0.30){ car.passed=true; crash(0.55,50,15,(playerX+car.offset)/2); }
+    }
+    if(fd>drawDistance*segmentLength || fd<-segmentLength*3){
+      if(position < goalZ-drawDistance*segmentLength) Object.assign(car,spawnCar(drawDistance*0.55,drawDistance*0.95));
     }
   }
-  traffic = traffic.filter(t => t.y < H + 120);
+  const target=Math.min(9,5+Math.floor(elapsed/10));
+  while(cars.length<target && position<goalZ-drawDistance*segmentLength) cars.push(spawnCar(drawDistance*0.6,drawDistance*0.95));
 
-  // 排気煙(低速時に濃く)
-  if (frame % 4 === 0) {
-    particles.push({
-      x: player.x + (Math.random()-0.5)*10, y: player.y + player.h/2 + 4,
-      vx: (Math.random()-0.5)*0.6, vy: 1.5 + Math.random(),
-      life: 20, color: 'smoke',
-    });
-  }
+  // パトカー(序盤は控えめ→徐々に本気)
+  const cruise=Math.min(0.84,0.52+elapsed*0.004);
+  policeGap+=(speedPercent-cruise)*2.4; if(offRoad) policeGap-=0.5;
+  policeGap=Math.min(310,policeGap);
+  if(policeGap<55){ state='lose'; loseReason='caught'; bestSaveCheck(); return; }
 
-  for (const p of particles) {
-    p.x += p.vx; p.y += p.vy; p.life--;
-    if (p.color !== 'smoke') p.vy += 0.15;
-  }
-  particles = particles.filter(p => p.life > 0);
-
-  // パトカーAI
-  const cruise = 7.5 * difficulty;
-  policeGap += (player.speed - cruise) * 0.55;
-  policeGap = Math.min(policeGap, 320);
-  const prevX = police.x;
-  police.x += (player.x - police.x) * 0.05;
-  police.tilt = (police.x - prevX) * 0.03;
-  police.y = player.y + Math.max(20, policeGap);
-
-  if (policeGap < 55) {
-    state = 'over';
-    best = Math.max(best, Math.floor(score));
-    localStorage.setItem('carChaseBest', best);
-  }
-
-  if (shake > 0) shake--;
+  for(const p of particles){ p.x+=p.vx; p.y+=p.vy; p.vy+=0.15; p.life--; }
+  particles=particles.filter(p=>p.life>0);
+  if(shake>0) shake*=0.86;
+  if(flashRed>0) flashRed-=1;
+}
+function bestSaveCheck(){}
+function crash(mul,gap,sh,atX){
+  speed*=mul; policeGap-=gap; shake=Math.max(shake,sh); flashRed=10;
+  const px=W/2+(atX!==undefined?atX:playerX)*60, py=H*0.78;
+  for(let i=0;i<22;i++) particles.push({x:px,y:py,vx:(Math.random()-0.5)*8,vy:(Math.random()-0.6)*8,
+    life:16+Math.random()*14,color:Math.random()<0.6?'#ffcc55':'#ff7733'});
 }
 
-// ===== 描画 =====
-function draw() {
-  ctx.save();
-  if (shake > 0) ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+// ===== 道路描画 =====
+function renderRoad(){
+  const baseSeg=findSegment(position);
+  const basePercent=(position%segmentLength)/segmentLength;
+  let x=0, dxc=-(baseSeg.curve*basePercent), maxy=H;
+  const proj=[];
+  for(let n=0;n<drawDistance;n++){
+    const idx=baseSeg.index+n;
+    if(idx>=segments.length) break;
+    const seg=segments[idx];
+    project(seg.p1,(playerX*roadWidth)-x,      cameraHeight, position);
+    project(seg.p2,(playerX*roadWidth)-x-dxc,  cameraHeight, position);
+    x+=dxc; dxc+=seg.curve;
+    proj[n]={seg,p1:{...seg.p1.screen},p2:{...seg.p2.screen},clip:maxy};
+    if(seg.p1.camera.z<=cameraDepth || seg.p2.screen.y>=seg.p1.screen.y || seg.p2.screen.y>=maxy) continue;
+    drawSegment(seg,seg.p1.screen,seg.p2.screen);
+    maxy=seg.p2.screen.y;
+  }
+  return proj;
+}
+function drawSegment(seg,p1,p2){
+  const t=THEME[seg.theme], ci=seg.color;
+  ctx.fillStyle=t.verge[ci]; ctx.fillRect(0,p2.y,W,p1.y-p2.y);
+  // 縁石/欄干
+  poly(p1.x-p1.w*1.14,p1.y,p1.x-p1.w,p1.y,p2.x-p2.w,p2.y,p2.x-p2.w*1.14,p2.y,t.rumble[ci]);
+  poly(p1.x+p1.w,p1.y,p1.x+p1.w*1.14,p1.y,p2.x+p2.w*1.14,p2.y,p2.x+p2.w,p2.y,t.rumble[ci]);
+  // 路面
+  poly(p1.x-p1.w,p1.y,p1.x+p1.w,p1.y,p2.x+p2.w,p2.y,p2.x-p2.w,p2.y,t.road[ci]);
+  // 車線
+  if(ci===0){ const l1=p1.w*0.04,l2=p2.w*0.04;
+    poly(p1.x-l1,p1.y,p1.x+l1,p1.y,p2.x+l2,p2.y,p2.x-l2,p2.y, seg.theme==='bridge'?'#d8dde3':'#e9e7cf'); }
+}
 
-  // 路肩の芝(グラデーション)
-  const grass = ctx.createLinearGradient(0, 0, W, 0);
-  grass.addColorStop(0, '#1e4d36');
-  grass.addColorStop(0.15, '#2d6a4f');
-  grass.addColorStop(0.85, '#2d6a4f');
-  grass.addColorStop(1, '#1e4d36');
-  ctx.fillStyle = grass;
-  ctx.fillRect(-20, -20, W+40, H+40);
-
-  // 街路樹・茂み(道路より下に描く)
-  for (const r of roadside) {
-    const x = r.side === 0 ? ROAD_X * 0.45 : W - ROAD_X * 0.45;
-    if (r.type === 'tree') {
-      ctx.fillStyle = 'rgba(0,0,0,.3)';
-      ctx.beginPath(); ctx.ellipse(x+3, r.y+4, r.size, r.size*0.8, 0, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = `hsl(${120 + r.tone*30}, 38%, ${24 + r.tone*10}%)`;
-      ctx.beginPath(); ctx.arc(x, r.y, r.size, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = `hsl(${120 + r.tone*30}, 42%, ${32 + r.tone*10}%)`;
-      ctx.beginPath(); ctx.arc(x - r.size*0.25, r.y - r.size*0.25, r.size*0.55, 0, Math.PI*2); ctx.fill();
-    } else {
-      ctx.fillStyle = `hsl(${100 + r.tone*30}, 35%, ${26 + r.tone*8}%)`;
-      ctx.beginPath(); ctx.ellipse(x, r.y, r.size*0.9, r.size*0.55, 0, 0, Math.PI*2); ctx.fill();
+// ===== スプライト/構造物(遠→近) =====
+function renderWorld(proj, night){
+  const carsBySeg={};
+  for(const car of cars){ const si=clamp(Math.floor(car.z/segmentLength),0,segments.length-1);
+    (carsBySeg[si]=carsBySeg[si]||[]).push(car); }
+  for(let n=proj.length-1;n>=0;n--){
+    const pr=proj[n]; if(!pr) continue; const s=pr.p1, seg=pr.seg;
+    if(!isFinite(s.scale)||s.scale<=0||s.scale>0.05) continue;
+    if(s.y<0||s.y>H+40) continue;
+    // トンネルの壁/天井
+    if(seg.theme==='tunnel') drawTunnel(pr);
+    // スプライト
+    for(const sp of seg.sprites){
+      const sx=s.x+(sp.offset||0)*s.w;
+      if(sp.kind==='bld') drawBuilding(sx,s.y,s.scale,sp,night);
+      else if(sp.kind==='tree') drawTree(sx,s.y,s.scale,sp);
+      else if(sp.kind==='lamp') drawLamp(sx,s.y,s.scale,night);
+      else if(sp.kind==='tower') drawTower(pr);
+      else if(sp.kind==='goal') drawGoal(pr);
+      else if(sp.kind==='sign') drawSign(sx,s.y,s.scale,sp);
+      else if(sp.kind==='zonesign') drawZoneSign(sx,s.y,s.scale,sp);
     }
+    const list=carsBySeg[seg.index];
+    if(list) for(const car of list){ const cx=s.x+car.offset*s.w;
+      drawVehicle(cx,s.y,s.scale*950*W/2,car.color,{night}); }
   }
+}
 
-  // アスファルト(テクスチャを2枚スクロール)
-  ctx.drawImage(asphalt, ROAD_X, texOffset - TEX_H);
-  ctx.drawImage(asphalt, ROAD_X, texOffset);
-  ctx.drawImage(asphalt, ROAD_X, texOffset + TEX_H);
-
-  // 路肩の縁石(白)
-  ctx.fillStyle = '#d8d8d2';
-  ctx.fillRect(ROAD_X - 4, -20, 6, H+40);
-  ctx.fillRect(ROAD_X + ROAD_W - 2, -20, 6, H+40);
-
-  // ガードレール(支柱がスクロール)
-  ctx.fillStyle = '#9aa0a8';
-  ctx.fillRect(ROAD_X - 14, -20, 4, H+40);
-  ctx.fillRect(ROAD_X + ROAD_W + 10, -20, 4, H+40);
-  ctx.fillStyle = '#777e88';
-  for (let y = (texOffset % 64) - 64; y < H + 40; y += 64) {
-    ctx.fillRect(ROAD_X - 16, y, 8, 5);
-    ctx.fillRect(ROAD_X + ROAD_W + 8, y, 8, 5);
-  }
-
-  // 車線の破線
-  ctx.strokeStyle = 'rgba(235,235,225,.7)';
-  ctx.lineWidth = 4;
-  ctx.setLineDash([24, 24]);
-  ctx.lineDashOffset = -dashOffset;
-  for (let i = 1; i < LANES; i++) {
-    const x = ROAD_X + LANE_W * i;
-    ctx.beginPath();
-    ctx.moveTo(x, -20);
-    ctx.lineTo(x, H + 20);
+// カーブ警告標識(黄色ひし形＋曲がり矢印)
+function drawSign(sx,baseY,scale,sp){
+  const d=scale*660*W/2;                 // ひし形の対角
+  const poleH=scale*1150*W/2;
+  if(!isFinite(d)||d<4||d>W*2||poleH>H*3) return;
+  const poleW=Math.max(1,scale*45*W/2), topY=baseY-poleH;
+  ctx.fillStyle='#4a4a4a'; ctx.fillRect(sx-poleW/2,baseY-poleH,poleW,poleH);
+  const cy=topY-d*0.1;
+  // ひし形
+  ctx.save(); ctx.translate(sx,cy); ctx.rotate(Math.PI/4);
+  ctx.fillStyle='#111'; ctx.fillRect(-d*0.38,-d*0.38,d*0.76,d*0.76);
+  ctx.fillStyle='#f5c518'; ctx.fillRect(-d*0.34,-d*0.34,d*0.68,d*0.68);
+  ctx.restore();
+  // 曲がり矢印
+  if(d>14){
+    ctx.strokeStyle='#111'; ctx.lineWidth=Math.max(1.5,d*0.05); ctx.lineJoin='round'; ctx.lineCap='round';
+    const w=d*0.22; ctx.beginPath();
+    if(sp.dir>0){ ctx.moveTo(sx-w,cy+w*0.8); ctx.lineTo(sx-w,cy-w*0.1); ctx.quadraticCurveTo(sx-w,cy-w*0.9,sx+w*0.1,cy-w*0.9); ctx.lineTo(sx+w,cy-w*0.9);
+      ctx.moveTo(sx+w*0.2,cy-w*1.4); ctx.lineTo(sx+w,cy-w*0.9); ctx.lineTo(sx+w*0.2,cy-w*0.4); }
+    else { ctx.moveTo(sx+w,cy+w*0.8); ctx.lineTo(sx+w,cy-w*0.1); ctx.quadraticCurveTo(sx+w,cy-w*0.9,sx-w*0.1,cy-w*0.9); ctx.lineTo(sx-w,cy-w*0.9);
+      ctx.moveTo(sx-w*0.2,cy-w*1.4); ctx.lineTo(sx-w,cy-w*0.9); ctx.lineTo(sx-w*0.2,cy-w*0.4); }
     ctx.stroke();
   }
-  ctx.setLineDash([]);
+}
+// ゾーン案内看板(青地・白文字)
+function drawZoneSign(sx,baseY,scale,sp){
+  const bw=scale*1500*W/2, bh=scale*520*W/2, poleH=scale*1050*W/2;
+  if(!isFinite(bw)||bw<6||bw>W*3||poleH>H*3) return;
+  const poleW=Math.max(1,scale*50*W/2), topY=baseY-poleH-bh;
+  ctx.fillStyle='#4a4a4a'; ctx.fillRect(sx-poleW/2,baseY-poleH-bh*0.1,poleW,poleH+bh*0.1);
+  ctx.fillStyle='#1b57a6'; rr(sx-bw/2,topY,bw,bh,bh*0.12); ctx.fill();
+  ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(1,bh*0.06); rr(sx-bw/2,topY,bw,bh,bh*0.12); ctx.stroke();
+  if(bh>12){ ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font=`bold ${Math.max(6,bh*0.42)}px sans-serif`;
+    ctx.fillText(sp.text, sx, topY+bh*0.62); }
+}
 
-  // スピード感のある流れ線
-  if (state === 'play' && player.speed > 8) {
-    ctx.strokeStyle = `rgba(255,255,255,${(player.speed - 8) * 0.03})`;
-    ctx.lineWidth = 2;
-    for (let i = 0; i < 6; i++) {
-      const x = ROAD_X + ((i * 73 + frame * 5) % ROAD_W);
-      const y = (i * 157 + frame * player.speed * 1.6) % (H + 80) - 40;
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x, y + player.speed * 4);
-      ctx.stroke();
+function drawTunnel(pr){
+  const p1=pr.p1,p2=pr.p2;
+  if(!isFinite(p1.scale)||p1.scale<=0) return;
+  const c1=p1.y-p1.scale*TUN_H*H/2, c2=p2.y-p2.scale*TUN_H*H/2;
+  // 壁
+  poly(p1.x-p1.w*1.14,p1.y,p1.x-p1.w*1.14,c1,p2.x-p2.w*1.14,c2,p2.x-p2.w*1.14,p2.y,'#2a2a30');
+  poly(p1.x+p1.w*1.14,p1.y,p1.x+p1.w*1.14,c1,p2.x+p2.w*1.14,c2,p2.x+p2.w*1.14,p2.y,'#2a2a30');
+  // 天井
+  poly(p1.x-p1.w*1.14,c1,p1.x+p1.w*1.14,c1,p2.x+p2.w*1.14,c2,p2.x-p2.w*1.14,c2,'#17171c');
+  // 天井灯
+  if(pr.seg.index%4===0){ ctx.fillStyle='rgba(255,236,170,.9)';
+    const lw=Math.max(2,p2.w*0.5); ctx.fillRect(p2.x-lw/2,c2-2,lw,Math.max(2,p2.scale*120*H/2)); }
+}
+
+function drawBuilding(sx,baseY,scale,sp,night){
+  const bw=scale*sp.w*W/2, bh=scale*sp.h*W/2;
+  if(!isFinite(bw)||!isFinite(bh)||bw<1||bw>W*3||bh>H*3||baseY<0) return;
+  const x=sx-(sp.offset>0?0:bw), top=baseY-bh;
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.fillRect(x-1,top,bw+2,bh);
+  ctx.fillStyle=sp.color; ctx.fillRect(x,top,bw,bh);
+  ctx.fillStyle='rgba(0,0,0,.22)'; ctx.fillRect(sp.offset>0?x:x+bw*0.78,top,bw*0.22,bh);
+  if(sp.windows&&bw>10){
+    const cols=Math.min(24,Math.max(2,Math.floor(bw/9))), rows=Math.min(48,Math.max(2,Math.floor(bh/11)));
+    const gw=bw/cols, gh=bh/rows;
+    for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+      const lit=((r*7+c*13+((sp.lit*100)|0))%5) < (night>0.3?3:(sp.lit>0.5?2:1));
+      ctx.fillStyle=lit?'rgba(255,224,150,.92)':'rgba(20,24,34,.55)';
+      ctx.fillRect(x+c*gw+gw*0.2, top+r*gh+gh*0.2, gw*0.6, gh*0.55);
     }
   }
+}
+function drawTree(sx,baseY,scale,sp){
+  const h=scale*sp.h*W/2, w=scale*sp.w*W/2;
+  if(!isFinite(h)||h<3||h>H*3||w>W*2) return;
+  ctx.fillStyle='#5a4028'; ctx.fillRect(sx-w*0.07,baseY-h*0.35,w*0.14,h*0.35);
+  ctx.fillStyle=`hsl(${110+sp.tone*30},42%,${26+sp.tone*10}%)`;
+  ctx.beginPath(); ctx.ellipse(sx,baseY-h*0.55,w*0.5,h*0.5,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=`hsl(${110+sp.tone*30},46%,${34+sp.tone*10}%)`;
+  ctx.beginPath(); ctx.arc(sx-w*0.14,baseY-h*0.7,w*0.3,0,Math.PI*2); ctx.fill();
+}
+function drawLamp(sx,baseY,scale,night){
+  const h=scale*1300*W/2, w=Math.max(1,scale*55*W/2);
+  if(h<4||h>H*3) return;
+  ctx.fillStyle='#2b2b30'; ctx.fillRect(sx-w/2,baseY-h,w,h);
+  ctx.fillStyle=night>0.25?'rgba(255,228,150,1)':'rgba(255,220,150,.9)';
+  ctx.beginPath(); ctx.arc(sx,baseY-h,Math.max(2,w*1.6),0,Math.PI*2); ctx.fill();
+  if(night>0.2){ ctx.fillStyle='rgba(255,224,150,.22)';
+    ctx.beginPath(); ctx.arc(sx,baseY-h,Math.max(6,w*5),0,Math.PI*2); ctx.fill(); }
+}
+// 吊り橋の主塔＋ケーブル(明石/レインボー風)
+function drawTower(pr){
+  const p1=pr.p1; if(!isFinite(p1.scale)||p1.scale<=0||p1.scale>0.05) return;
+  const baseY=p1.y, w=p1.w, cx=p1.x;
+  const towerH=p1.scale*5200*W/2, legW=Math.max(2,p1.scale*160*W/2);
+  if(towerH<6||towerH>H*4) return;
+  const topY=baseY-towerH;
+  const lx=cx-w*1.1, rx=cx+w*1.1;
+  ctx.fillStyle='#d6443f';                 // レインボーブリッジ風の朱色
+  ctx.fillRect(lx-legW/2,topY,legW,towerH);
+  ctx.fillRect(rx-legW/2,topY,legW,towerH);
+  // 横梁
+  ctx.fillRect(lx-legW/2,topY,(rx-lx)+legW,legW*0.9);
+  ctx.fillRect(lx-legW/2,topY+towerH*0.42,(rx-lx)+legW,legW*0.7);
+  // 主ケーブル(塔頂から手前へ垂れる)
+  ctx.strokeStyle='rgba(235,235,240,.85)'; ctx.lineWidth=Math.max(1,legW*0.22);
+  ctx.beginPath(); ctx.moveTo(lx,topY); ctx.quadraticCurveTo(cx-w*0.4,baseY-towerH*0.12,W/2-w*0.3,H*0.98); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(rx,topY); ctx.quadraticCurveTo(cx+w*0.4,baseY-towerH*0.12,W/2+w*0.3,H*0.98); ctx.stroke();
+  // 吊りケーブル(縦)
+  ctx.strokeStyle='rgba(220,220,228,.5)'; ctx.lineWidth=1;
+  for(let i=1;i<6;i++){ const t=i/6, hx=lerp(lx,W/2-w*0.3,t), hy=lerp(topY,H*0.98,t*t);
+    ctx.beginPath(); ctx.moveTo(hx,hy); ctx.lineTo(hx,baseY); ctx.stroke(); }
+}
+function drawGoal(pr){
+  const p1=pr.p1; if(!isFinite(p1.scale)||p1.scale<=0||p1.scale>0.05) return;
+  const baseY=p1.y, w=p1.w, cx=p1.x, h=p1.scale*2600*W/2;
+  if(h<6||h>H*4) return;
+  const topY=baseY-h, legW=Math.max(2,p1.scale*150*W/2);
+  ctx.fillStyle='#e8e8ee'; ctx.fillRect(cx-w*1.1-legW,topY,legW,h); ctx.fillStyle='#e8e8ee'; ctx.fillRect(cx+w*1.1,topY,legW,h);
+  // チェッカー横断幕
+  const bw=(w*2.2+legW*2), bh=Math.max(4,h*0.14), bx=cx-w*1.1-legW, by=topY;
+  const cells=Math.max(6,Math.floor(bw/Math.max(6,bh)));
+  const cw=bw/cells;
+  for(let i=0;i<cells;i++){ ctx.fillStyle=(i%2)?'#111':'#fff'; ctx.fillRect(bx+i*cw,by,cw,bh/2);
+    ctx.fillStyle=(i%2)?'#fff':'#111'; ctx.fillRect(bx+i*cw,by+bh/2,cw,bh/2); }
+  ctx.fillStyle='#ffcf33'; ctx.font=`bold ${Math.max(8,bh*0.9)}px sans-serif`; ctx.textAlign='center';
+  ctx.fillText('GOAL', cx, by+bh*1.7);
+}
 
-  // 一般車
-  for (const t of traffic) drawCar(t.x, t.y, t.w, t.h, t.hit ? '#6e6e72' : t.color, t.type);
+// 車(後ろ姿)
+function drawVehicle(cx,baseY,w,color,opts){
+  w=Math.max(6,w); const h=w*0.78, x=cx-w/2, y=baseY-h;
+  ctx.fillStyle='rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(cx,baseY-2,w*0.6,h*0.16,0,0,Math.PI*2); ctx.fill();
+  const g=ctx.createLinearGradient(x,0,x+w,0);
+  g.addColorStop(0,shade(color,-35)); g.addColorStop(0.5,color); g.addColorStop(1,shade(color,-35));
+  ctx.fillStyle=g; rr(x,y+h*0.28,w,h*0.72,w*0.14); ctx.fill();
+  ctx.fillStyle=shade(color,-15); rr(x+w*0.14,y,w*0.72,h*0.42,w*0.1); ctx.fill();
+  ctx.fillStyle='#1b2735'; rr(x+w*0.2,y+h*0.08,w*0.6,h*0.3,w*0.06); ctx.fill();
+  ctx.fillStyle = opts&&opts.brake ? '#ff3b3b' : '#e02531';
+  rr(x+w*0.08,y+h*0.5,w*0.26,h*0.14,2); ctx.fill(); rr(x+w*0.66,y+h*0.5,w*0.26,h*0.14,2); ctx.fill();
+  if(opts&&opts.police){ const bl=Math.floor(elapsed*10)%2===0;
+    ctx.fillStyle=bl?'#ff2233':'#55121a'; rr(x+w*0.2,y-h*0.12,w*0.26,h*0.12,2); ctx.fill();
+    ctx.fillStyle=bl?'#27246b':'#2244ff'; rr(x+w*0.54,y-h*0.12,w*0.26,h*0.12,2); ctx.fill(); }
+  if(opts&&opts.night>0.3){ ctx.fillStyle='rgba(255,60,60,.5)';
+    ctx.fillRect(x+w*0.06,y+h*0.52,w*0.3,h*0.1); ctx.fillRect(x+w*0.64,y+h*0.52,w*0.3,h*0.1); }
+}
 
-  // パトカーと自車
-  drawCar(police.x, police.y, police.w, police.h, '#15173d', 'police', police.tilt);
-  drawCar(player.x, player.y, player.w, player.h, '#c81e2b', 'player', player.tilt);
+// 三人称の自車(画面下・後ろ姿)
+function drawPlayerCar(){
+  const pSeg=findSegment(position+segmentLength);
+  const lean=playerX*5 + pSeg.curve*1.4;
+  const cx=W/2+lean, baseY=H*0.95, w=112;
+  const braking = keys['arrowdown']||keys['s'];
+  drawVehicle(cx,baseY,w,'#d1232f',{brake:braking});
+  // 砂埃(路外時)
+  if(Math.abs(playerX)>1 && Math.random()<0.5)
+    particles.push({x:cx+(Math.random()-0.5)*60,y:baseY-6,vx:(Math.random()-0.5)*3,vy:-Math.random()*2,life:14,color:'rgba(150,140,120,'});
+}
 
-  // パーティクル
-  for (const p of particles) {
-    if (p.color === 'smoke') {
-      ctx.fillStyle = `rgba(160,160,165,${p.life / 80})`;
-      ctx.beginPath(); ctx.arc(p.x, p.y, (24 - p.life) * 0.35 + 2, 0, Math.PI*2); ctx.fill();
-    } else {
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = Math.min(1, p.life / 12);
-      ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
-      ctx.globalAlpha = 1;
-    }
+// バックミラー
+function drawMirror(){
+  const mw=150,mh=56,mx=W/2-mw/2,my=10;
+  ctx.fillStyle='#15151c'; rr(mx-5,my-5,mw+10,mh+14,12); ctx.fill();
+  ctx.save(); rr(mx,my,mw,mh,8); ctx.clip();
+  const g=ctx.createLinearGradient(0,my,0,my+mh); g.addColorStop(0,'#2a2740'); g.addColorStop(1,'#3a3a42');
+  ctx.fillStyle=g; ctx.fillRect(mx,my,mw,mh);
+  ctx.fillStyle='#2e2e34'; ctx.beginPath();
+  ctx.moveTo(mx+mw*0.42,my+mh*0.42); ctx.lineTo(mx+mw*0.58,my+mh*0.42);
+  ctx.lineTo(mx+mw*0.95,my+mh); ctx.lineTo(mx+mw*0.05,my+mh); ctx.closePath(); ctx.fill();
+  const danger=clamp(1-(policeGap-55)/265,0,1);
+  drawVehicle(mx+mw/2,my+mh-2,18+danger*64,'#15173d',{police:true});
+  ctx.restore();
+  ctx.fillStyle='rgba(255,255,255,.75)'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('🚓 後方',W/2,my+mh+12);
+}
+
+const ZONE_JP={country:'田舎道',city:'都会',tunnel:'トンネル',bridge:'海峡大橋',finish:'ゴール目前'};
+function drawHUD(){
+  // タイマー(大)
+  const tcol = timeLeft<10 ? (Math.floor(elapsed*6)%2?'#ff3b3b':'#ffd23b') : '#fff';
+  ctx.textAlign='center'; ctx.fillStyle='rgba(10,10,16,.5)'; rr(W/2-60,H-46,120,34,8); ctx.fill();
+  ctx.fillStyle=tcol; ctx.font='bold 26px monospace'; ctx.fillText(timeLeft.toFixed(1),W/2,H-20);
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.font='10px sans-serif'; ctx.fillText('TIME',W/2,H-50);
+
+  ctx.textAlign='left';
+  ctx.fillStyle='rgba(10,10,16,.5)'; rr(10,10,150,54,8); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
+  ctx.fillText(`${Math.floor(speed/maxSpeed*300)} km/h`,20,30);
+  ctx.fillStyle='#ffd27a'; ctx.font='12px sans-serif'; ctx.fillText(ZONE_JP[themeAt(position)]||'',20,50);
+
+  const danger=clamp(1-(policeGap-55)/265,0,1);
+  ctx.fillStyle='rgba(10,10,16,.5)'; rr(W-120,10,110,38,8); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font='11px sans-serif'; ctx.fillText('接近度',W-112,25);
+  ctx.fillStyle='#333'; ctx.fillRect(W-112,30,94,8);
+  ctx.fillStyle=danger>0.7?'#ff3344':danger>0.4?'#ffaa00':'#44dd66'; ctx.fillRect(W-112,30,94*danger,8);
+
+  // ゴールまでの進捗
+  const prog=clamp(position/goalZ,0,1);
+  ctx.fillStyle='rgba(10,10,16,.5)'; rr(10,H-46,W/2-80,34,8); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.font='9px sans-serif'; ctx.fillText('GOALまで',18,H-32);
+  ctx.fillStyle='#333'; ctx.fillRect(18,H-26,W/2-100,8);
+  ctx.fillStyle='#5fd0ff'; ctx.fillRect(18,H-26,(W/2-100)*prog,8);
+  ctx.fillStyle='#fff'; ctx.font='11px sans-serif'; ctx.fillText('🏁',18+(W/2-100)*prog-4,H-18);
+}
+
+function drawCountdown(){
+  const n=Math.ceil(countT);
+  let label = n>=1 ? String(n) : 'GO!';
+  if(countT>2) label='3'; else if(countT>1) label='2'; else if(countT>0) label='1';
+  const go = countT<=0.0;
+  ctx.textAlign='center';
+  const frac = countT - Math.floor(countT);
+  const scale = 1 + (1-frac)*0.6;
+  ctx.save(); ctx.translate(W/2,H*0.4); ctx.scale(scale,scale);
+  ctx.fillStyle = go?'#49e06b':'#fff'; ctx.font='bold 90px sans-serif';
+  ctx.shadowColor='rgba(0,0,0,.6)'; ctx.shadowBlur=18;
+  ctx.fillText(go?'GO!':label,0,30); ctx.restore();
+  ctx.fillStyle='rgba(255,255,255,.85)'; ctx.font='16px sans-serif';
+  ctx.fillText('60秒以内にゴールへ!',W/2,H*0.4+90);
+}
+
+function drawTitle(){
+  ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.fillStyle='#fff';
+  ctx.font='bold 36px sans-serif'; ctx.fillText('カーチェイス!',W/2,H*0.28);
+  ctx.font='15px sans-serif'; ctx.fillStyle='#cdd';
+  ctx.fillText('田舎 → 都会 → トンネル → 海峡大橋 → ゴール',W/2,H*0.28+34);
+  ctx.fillText('60秒以内にゴールへ。パトカーに捕まるな!',W/2,H*0.28+58);
+  if(bestTime>0){ ctx.fillStyle='#ffd27a'; ctx.fillText(`ベスト: 残り ${bestTime.toFixed(1)}秒でゴール`,W/2,H*0.28+84); }
+  // スタートボタン
+  const bw=200,bh=56,bx=W/2-bw/2,by=H*0.6;
+  const pulse=0.5+0.5*Math.sin(Date.now()/350);
+  ctx.fillStyle=`rgba(40,180,90,${0.75+pulse*0.25})`; rr(bx,by,bw,bh,14); ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,.8)'; ctx.lineWidth=2; rr(bx,by,bw,bh,14); ctx.stroke();
+  ctx.fillStyle='#fff'; ctx.font='bold 24px sans-serif'; ctx.fillText('▶ スタート',W/2,by+37);
+  ctx.font='12px sans-serif'; ctx.fillStyle='#bcd';
+  ctx.fillText('クリック / スペース / タップ',W/2,by+bh+22);
+}
+
+function drawResult(){
+  ctx.fillStyle='rgba(0,0,0,.66)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  if(state==='win'){
+    ctx.fillStyle='#49e06b'; ctx.font='bold 44px sans-serif'; ctx.fillText('ゴール!!',W/2,H*0.38);
+    ctx.fillStyle='#fff'; ctx.font='bold 22px sans-serif';
+    ctx.fillText(`クリアタイム ${(TIME_LIMIT-timeLeft).toFixed(1)}秒`,W/2,H*0.5);
+    ctx.font='16px sans-serif'; ctx.fillText(`残り ${timeLeft.toFixed(1)}秒`,W/2,H*0.5+28);
+    ctx.fillStyle='#ffd27a'; ctx.fillText(`ベスト: 残り ${bestTime.toFixed(1)}秒`,W/2,H*0.5+52);
+  } else {
+    ctx.fillStyle='#ff5566'; ctx.font='bold 40px sans-serif';
+    ctx.fillText(loseReason==='timeup'?'タイムアップ!':'御用だ!!',W/2,H*0.4);
+    ctx.fillStyle='#fff'; ctx.font='16px sans-serif';
+    ctx.fillText(loseReason==='timeup'?'ゴールに届かなかった…':'パトカーに捕まった…',W/2,H*0.4+30);
+    const prog=clamp(position/goalZ,0,1);
+    ctx.fillText(`ゴールまで 残り ${Math.round((1-prog)*100)}%`,W/2,H*0.4+54);
   }
+  const blink=Math.floor(Date.now()/500)%2===0;
+  if(blink){ ctx.fillStyle='#fff'; ctx.font='bold 18px sans-serif';
+    ctx.fillText('スペース / タップ でタイトルへ',W/2,H*0.68); }
+}
+
+// ===== メインループ =====
+let skyline=null;
+function drawSkyline(shift,night){
+  if(!skyline){ skyline=[]; let px=-60; while(px<W+60){ const w=24+Math.random()*46,h=30+Math.random()*90; skyline.push({px,w,h}); px+=w+4+Math.random()*10; } }
+  const horizon=H/2;
+  for(const b of skyline){ ctx.fillStyle=`rgba(30,34,54,${0.6+night*0.3})`; ctx.fillRect(b.px-shift*0.4,horizon-b.h,b.w,b.h);
+    if(night>0.3){ ctx.fillStyle='rgba(255,220,150,.5)'; for(let i=0;i<2;i++) ctx.fillRect(b.px-shift*0.4+4+i*8,horizon-b.h+6+i*10,2,2); } }
+}
+
+function frame(){
+  update();
+  const t = state==='play'||state==='count' ? elapsed : (state==='title'?0:elapsed);
+  const sky = skyAt(state==='title'?0:t);
+
+  ctx.save();
+  if(shake>0.5) ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);
+
+  // 空
+  const g=ctx.createLinearGradient(0,0,0,H*0.6);
+  g.addColorStop(0,sky.top); g.addColorStop(0.6,sky.mid); g.addColorStop(1,sky.bot);
+  ctx.fillStyle=g; ctx.fillRect(-30,-30,W+60,H*0.55+30);
+  // 太陽/月
+  const sunX=W*0.74, sunY=lerp(H*0.3,H*0.12,clamp(t/60,0,1));
+  ctx.fillStyle=sky.dark>0.3?'rgba(255,240,210,.85)':'rgba(255,240,200,.7)';
+  ctx.beginPath(); ctx.arc(sunX,sunY,24,0,Math.PI*2); ctx.fill();
+
+  const baseSeg=findSegment(position);
+  const curTheme=baseSeg.theme;
+  if(curTheme==='city'||curTheme==='country'||curTheme==='finish') drawSkyline(playerX*26-baseSeg.curve*10, sky.dark);
+  if(curTheme==='bridge'){ // 海の水平線
+    ctx.fillStyle='rgba(40,110,150,.5)'; ctx.fillRect(0,H/2-6,W,10); }
+
+  const proj=renderRoad();
+  renderWorld(proj, sky.dark);
+
+  for(const p of particles){ ctx.globalAlpha=Math.min(1,p.life/14);
+    ctx.fillStyle = p.color.startsWith('rgba')?p.color+ (Math.min(1,p.life/14))+')' : p.color;
+    ctx.fillRect(p.x-2,p.y-2,4,4); ctx.globalAlpha=1; }
+
+  if(state==='play'||state==='count') drawPlayerCar();
 
   ctx.restore();
 
-  // HUD
-  if (state !== 'title') {
-    ctx.fillStyle = 'rgba(10,10,16,.55)';
-    roundRect(ctx, 10, 10, 156, 64, 8); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 16px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(`SCORE ${Math.floor(score)}`, 20, 32);
-    ctx.fillText(`SPEED ${Math.floor(player.speed * 20)} km/h`, 20, 56);
+  // 夜の暗さオーバーレイ
+  if(sky.dark>0.02){ ctx.fillStyle=`rgba(6,8,24,${sky.dark})`; ctx.fillRect(0,0,W,H*0.999); }
+  if(flashRed>0){ ctx.fillStyle=`rgba(255,40,40,${flashRed/28})`; ctx.fillRect(0,0,W,H); }
 
-    const danger = Math.max(0, Math.min(1, 1 - (policeGap - 55) / 265));
-    ctx.fillStyle = 'rgba(10,10,16,.55)';
-    roundRect(ctx, W - 160, 10, 150, 40, 8); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('🚓 接近度', W - 150, 26);
-    ctx.fillStyle = '#333';
-    ctx.fillRect(W - 150, 32, 130, 10);
-    ctx.fillStyle = danger > 0.7 ? '#ff3344' : danger > 0.4 ? '#ffaa00' : '#44dd66';
-    ctx.fillRect(W - 150, 32, 130 * danger, 10);
-  }
+  if(state==='play'||state==='count'){ drawMirror(); drawHUD(); }
+  if(state==='count') drawCountdown();
+  if(state==='title') drawTitle();
+  if(state==='win'||state==='lose') drawResult();
 
-  // タイトル / ゲームオーバー
-  if (state !== 'play') {
-    ctx.fillStyle = 'rgba(0,0,0,.65)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#fff';
-    ctx.textAlign = 'center';
-    const blink = Math.floor(Date.now() / 500) % 2 === 0;
-    if (state === 'title') {
-      ctx.font = 'bold 36px sans-serif';
-      ctx.fillText('カーチェイス!', W/2, H/2 - 60);
-      ctx.font = '16px sans-serif';
-      ctx.fillText('パトカーから逃げきれ!', W/2, H/2 - 20);
-      ctx.fillText('一般車にぶつかると減速して', W/2, H/2 + 10);
-      ctx.fillText('パトカーに追いつかれるぞ', W/2, H/2 + 34);
-      if (best > 0) ctx.fillText(`ベスト: ${best}`, W/2, H/2 + 60);
-      ctx.font = 'bold 20px sans-serif';
-      if (blink) ctx.fillText('スペースキー / タップ でスタート', W/2, H/2 + 100);
-    } else {
-      ctx.font = 'bold 38px sans-serif';
-      ctx.fillStyle = '#ff5566';
-      ctx.fillText('御用だ!!', W/2, H/2 - 50);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 22px sans-serif';
-      ctx.fillText(`SCORE: ${Math.floor(score)}`, W/2, H/2);
-      ctx.font = '16px sans-serif';
-      ctx.fillText(`ベスト: ${best}`, W/2, H/2 + 30);
-      ctx.font = 'bold 18px sans-serif';
-      if (blink) ctx.fillText('スペースキー / タップ でリトライ', W/2, H/2 + 80);
-    }
-  }
+  requestAnimationFrame(frame);
 }
 
-function loop() {
-  if (state === 'play') update();
-  else frame++;
-  draw();
-  requestAnimationFrame(loop);
-}
-reset();
-state = 'title';
-loop();
+buildTrack(); resetCars();
+frame();
 </script>
 </body>
 </html>
